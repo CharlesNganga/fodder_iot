@@ -30,3 +30,7 @@ Thumbs.db
 dist/
 build/
 *.egg-info/
+
+# Context files
+repomix-output.xml
+repomix-output.txt
