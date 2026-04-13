@@ -1,0 +1,32 @@
+# --- Python & Django ---
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+db.sqlite3
+media/
+static/
+venv/
+env/
+.venv/
+
+# --- IoT / ESP32 / PlatformIO ---
+.pio/
+.espressif/
+build/
+*.bin
+*.elf
+*.map
+
+# --- OS & Editors ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.log
+
+# --- Distribution / Packages ---
+dist/
+build/
+*.egg-info/
