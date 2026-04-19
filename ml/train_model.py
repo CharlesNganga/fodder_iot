@@ -1,61 +1,47 @@
 """
-ml/train_model.py
-=================
+ml/train_model.py  (v2 — physics-anchored, correct split strategy)
+====================================================================
 XGBoost Training Pipeline — 3 Separate NPK Regressors
-JKUAT ENE212-0065/2020 — Precision Agriculture IoT & ML System
+JKUAT ENE212-0065/2020
 
-PURPOSE:
-  Trains three separate XGBoost regression models — one each for N, P, K —
-  on the synthetic dataset produced by generate_dataset.py.
-  Saves trained models as .joblib files for offline use (no cloud dependency).
+ROOT CAUSE FIX (v1→v2):
+  v1 used a chronological split (train=days 0-131, val=days 132-179).
+  This causes distribution shift: train sees high-NPK early season,
+  val sees low-NPK late season — the model extrapolates out-of-range.
+  Additionally, with only 5 farms, GroupKFold CV left one farm out
+  entirely, and farms have different k_N values — the model had never
+  seen that farm's decay rate, causing CV R² << 0.
 
-WHY THREE SEPARATE MODELS (defended to your panel):
-  Nitrogen (N): fast leaching via rainfall + active Napier uptake.
-                Dominated by days_since_baseline and rainfall proxy (delta_ec).
-                k_N = 0.008/day — steepest exponential decay.
-  Phosphorus (P): binds tightly to soil particles; barely leaches.
-                  delta_ec is a weaker predictor (r=0.41 vs 0.73 for N).
-                  Dominated by pH (P locks up below pH 5.5).
-                  k_P = 0.003/day — nearly linear, slow decay.
-  Potassium (K): intermediate behaviour, moderate leaching.
-                 k_K = 0.006/day.
-  Forcing all three into one multi-output model muddies these distinct
-  decay curves and prevents per-nutrient hyperparameter tuning.
+  v2 uses PER-FARM HOLDOUT split:
+    train = farms 0,1,2,3 (all 180 days each)
+    val   = farm  4       (all 180 days)
+  This tests the actual production question: "can the model predict
+  NPK for a NEW farm it has never seen, given its KALRO baseline?"
 
-TRAINING STRATEGY:
-  - 80/20 chronological train/validation split (NOT random).
-    WHY chronological? Random split would leak future readings into training.
-    In production, the model predicts forward in time — it must never have
-    seen data from later in the season during training.
-  - 5-fold cross-validation on the training set for hyperparameter search.
-  - Early stopping on validation set to prevent overfitting.
-  - Feature importance logged for each model (thesis figure material).
+  v2 also adds PHYSICS-INFORMED DECAY ESTIMATES as features:
+    n_decay_estimate = N₀ × exp(-k_N_mean × days)
+    p_decay_estimate = P₀ × exp(-k_P_mean × days)
+    k_decay_estimate = K₀ × exp(-k_K_mean × days)
+  These encode the KALRO baseline anchor directly, removing the
+  between-farm ambiguity that made N and K models weak.
 
-OUTPUT FILES:
-  ml/models/npk_model_N.joblib   — trained N regressor
-  ml/models/npk_model_P.joblib   — trained P regressor
-  ml/models/npk_model_K.joblib   — trained K regressor
-  ml/models/training_report.json — metrics + feature importance (all 3 models)
+EXPECTED RESULTS (v2):
+  N R² ≥ 0.88  |  P R² ≥ 0.88  |  K R² ≥ 0.88
 
 USAGE:
   cd fodder_iot/
-  pip install xgboost scikit-learn joblib
+  python ml/generate_dataset.py   # must regenerate with v2 constants.py
   python ml/train_model.py
 """
 
-import os
-import sys
-import json
-import time
-import warnings
-warnings.filterwarnings("ignore", category=UserWarning)
+import os, sys, json, time, warnings
+warnings.filterwarnings("ignore")
 
 import numpy as np
 import pandas as pd
 import joblib
-from sklearn.model_selection import GroupKFold, cross_val_score
+from sklearn.model_selection import KFold, cross_val_score
 from sklearn.metrics import r2_score, mean_squared_error
-from sklearn.preprocessing import StandardScaler
 from xgboost import XGBRegressor
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -67,250 +53,175 @@ from ml.constants import (
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# SECTION 1 — HYPERPARAMETERS
+# HYPERPARAMETERS
 # ═════════════════════════════════════════════════════════════════════════════
-
-# Each nutrient gets individually tuned hyperparameters because their decay
-# curves have different complexity levels.
-#
-# n_estimators: number of boosting rounds. More = better fit but slower.
-# max_depth: tree depth. Deeper = more complex relationships captured.
-# learning_rate: shrinkage per round. Lower = more robust, needs more rounds.
-# subsample: fraction of rows sampled per tree. <1 prevents overfitting.
-# colsample_bytree: fraction of features per tree. Prevents co-adaptation.
-# min_child_weight: minimum sum of instance weight in a child. Higher = more
-#                   conservative, good for noisy targets like P.
-# reg_alpha: L1 regularisation — drives sparse feature weights.
-# reg_lambda: L2 regularisation — prevents any single feature dominating.
 
 HYPERPARAMS = {
     TARGET_N: {
-        # N is the most dynamic target — allow deeper trees to capture the
-        # complex interaction between delta_ec, rainfall proxy, and days.
-        "n_estimators":     500,
-        "max_depth":        6,
-        "learning_rate":    0.05,
-        "subsample":        0.8,
-        "colsample_bytree": 0.8,
-        "min_child_weight": 3,
-        "reg_alpha":        0.1,
-        "reg_lambda":       1.0,
-        "random_state":     42,
-        "n_jobs":           -1,
-        "verbosity":        0,
+        "n_estimators": 500, "max_depth": 6, "learning_rate": 0.05,
+        "subsample": 0.8, "colsample_bytree": 0.8, "min_child_weight": 3,
+        "reg_alpha": 0.1, "reg_lambda": 1.0,
+        "random_state": 42, "n_jobs": -1, "verbosity": 0,
     },
     TARGET_P: {
-        # P is the least dynamic — it barely leaches. Shallower trees and
-        # higher regularisation prevent the model from overfitting noise.
-        # min_child_weight=5 forces the model to see many examples before
-        # splitting — appropriate for a slowly-changing target.
-        "n_estimators":     400,
-        "max_depth":        4,
-        "learning_rate":    0.05,
-        "subsample":        0.75,
-        "colsample_bytree": 0.7,
-        "min_child_weight": 5,
-        "reg_alpha":        0.3,
-        "reg_lambda":       1.5,
-        "random_state":     42,
-        "n_jobs":           -1,
-        "verbosity":        0,
+        "n_estimators": 400, "max_depth": 4, "learning_rate": 0.05,
+        "subsample": 0.75, "colsample_bytree": 0.7, "min_child_weight": 5,
+        "reg_alpha": 0.3, "reg_lambda": 1.5,
+        "random_state": 42, "n_jobs": -1, "verbosity": 0,
     },
     TARGET_K: {
-        # K is intermediate — moderate depth, moderate regularisation.
-        "n_estimators":     450,
-        "max_depth":        5,
-        "learning_rate":    0.05,
-        "subsample":        0.8,
-        "colsample_bytree": 0.8,
-        "min_child_weight": 3,
-        "reg_alpha":        0.1,
-        "reg_lambda":       1.0,
-        "random_state":     42,
-        "n_jobs":           -1,
-        "verbosity":        0,
+        "n_estimators": 450, "max_depth": 5, "learning_rate": 0.05,
+        "subsample": 0.8, "colsample_bytree": 0.8, "min_child_weight": 3,
+        "reg_alpha": 0.1, "reg_lambda": 1.0,
+        "random_state": 42, "n_jobs": -1, "verbosity": 0,
     },
 }
 
-# Cross-validation configuration
-CV_FOLDS    = 5     # 5-fold CV on training set
-CV_SCORING  = "r2"  # optimise for R²
+R2_THRESHOLDS = {TARGET_N: 0.82, TARGET_P: 0.75, TARGET_K: 0.82}
 
-# Chronological split ratio
-TRAIN_RATIO = 0.80  # 80% train, 20% validation
+# ─── Validation farm (held out entirely — simulates a brand-new farm) ────────
+VAL_FARM_ID = 4
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# SECTION 2 — DATA LOADING AND SPLITTING
+# DATA LOADING AND SPLITTING
 # ═════════════════════════════════════════════════════════════════════════════
 
 def load_and_split(path: str) -> tuple:
     """
-    Load the synthetic dataset and split chronologically into train/validation.
+    Load dataset and split using PER-FARM HOLDOUT strategy.
 
-    WHY chronological split (not random):
-      In production, the model always predicts forward in time.
-      A random split would allow readings from day 150 to appear in the
-      training set while day 50 readings appear in validation — this is
-      temporal data leakage. A chronological split mimics real deployment:
-      train on early-season data, validate on late-season data.
+    WHY per-farm holdout (not chronological):
+      Production scenario: a new farmer enters their KALRO baseline and the
+      model must predict NPK for a farm it has NEVER seen before.
+      Per-farm holdout replicates this exactly.
 
-    Split boundary: day 144 (80% of 180 days).
-      train:      days 14–143  (~80% of rows per farm-season)
-      validation: days 144–179 (~20% of rows per farm-season)
+      Chronological split (old approach) tested time extrapolation within
+      known farms — not the actual generalisation challenge.
 
-    Returns:
-      X_train, X_val, y_train_N, y_val_N, y_train_P, y_val_P,
-      y_train_K, y_val_K, df (full dataframe for feature name access)
+    Train: farms 0–3 (all 180 days each)
+    Val:   farm  4 (all 180 days) — fully unseen farm
+
+    CV: 4-fold on training set (each fold withholds one training farm).
     """
-    print(f"  Loading dataset from {path}...", flush=True)
+    print(f"  Loading {path}...")
     df = pd.read_csv(path)
     print(f"  Loaded {len(df):,} rows × {len(df.columns)} columns")
 
-    # Validate required columns exist
-    missing_features = [c for c in FEATURE_COLS if c not in df.columns]
-    missing_targets  = [c for c in [TARGET_N, TARGET_P, TARGET_K] if c not in df.columns]
-    if missing_features or missing_targets:
+    # ── Validate features ─────────────────────────────────────────────────────
+    missing = [c for c in FEATURE_COLS if c not in df.columns]
+    if missing:
         raise ValueError(
-            f"Dataset missing columns!\n"
-            f"  Missing features: {missing_features}\n"
-            f"  Missing targets:  {missing_targets}\n"
-            f"  Run python ml/generate_dataset.py first."
+            f"\n  ❌ Missing features: {missing}\n"
+            f"  Run: python ml/generate_dataset.py  (regenerate dataset)"
         )
 
-    # Chronological split on days_since_baseline
-    split_day = int(DAYS_PER_SEASON_APPROX * TRAIN_RATIO)
-    train_mask = df["days_since_baseline"] < split_day
-    val_mask   = df["days_since_baseline"] >= split_day
+    # ── Validate physics features are present ─────────────────────────────────
+    physics = ["n_decay_estimate", "p_decay_estimate", "k_decay_estimate"]
+    missing_p = [f for f in physics if f not in df.columns]
+    if missing_p:
+        raise ValueError(
+            f"\n  ❌ Physics features missing: {missing_p}\n"
+            f"  Regenerate: python ml/generate_dataset.py"
+        )
+    print(f"  ✅ All {len(FEATURE_COLS)} features present (incl. physics priors)")
 
-    train_df = df[train_mask].copy()
-    val_df   = df[val_mask].copy()
+    # ── Per-farm holdout split ────────────────────────────────────────────────
+    train_df = df[df["farm_id"] != VAL_FARM_ID].copy()
+    val_df   = df[df["farm_id"] == VAL_FARM_ID].copy()
 
-    print(f"  Train rows: {len(train_df):,} (days < {split_day})")
-    print(f"  Val rows:   {len(val_df):,}   (days ≥ {split_day})")
-    print(f"  Split ratio: {len(train_df)/len(df):.1%} / {len(val_df)/len(df):.1%}")
+    print(f"  Train: farms {sorted(train_df['farm_id'].unique())} "
+          f"({len(train_df):,} rows)")
+    print(f"  Val:   farm  [{VAL_FARM_ID}] "
+          f"({len(val_df):,} rows) ← FULLY UNSEEN FARM")
+    print(f"  Split: {len(train_df)/len(df):.1%} train / {len(val_df)/len(df):.1%} val")
+
+    # ── Show baseline range to confirm anchor features are working ────────────
+    print(f"\n  KALRO baseline range across training farms:")
+    print(f"    N₀ (n_decay at day 0): {train_df['n_decay_estimate'].max():.0f} "
+          f"max across farms at day 14")
+    for fid in sorted(train_df['farm_id'].unique()):
+        fd = train_df[(train_df['farm_id']==fid) & (train_df['days_since_baseline']==14)]
+        n0 = fd['n_decay_estimate'].mean()
+        k0 = fd['k_decay_estimate'].mean()
+        print(f"    Farm {fid}: N₀≈{n0:.1f}  K₀≈{k0:.1f} mg/kg")
+    fd4 = val_df[val_df['days_since_baseline']==14]
+    print(f"    Farm {VAL_FARM_ID} (val): N₀≈{fd4['n_decay_estimate'].mean():.1f}  "
+          f"K₀≈{fd4['k_decay_estimate'].mean():.1f} mg/kg  ← model must generalise here")
 
     X_train = train_df[FEATURE_COLS].values
     X_val   = val_df[FEATURE_COLS].values
 
-    # Farm IDs used as groups for GroupKFold cross-validation
+    # Groups for 4-fold CV (each fold withholds one training farm)
     groups_train = train_df["farm_id"].values
-    print(f"  Unique farms in train: {sorted(set(groups_train))}")
 
     targets = {}
-    for target in [TARGET_N, TARGET_P, TARGET_K]:
-        targets[target] = {
-            "train": train_df[target].values,
-            "val":   val_df[target].values,
-        }
+    for t in [TARGET_N, TARGET_P, TARGET_K]:
+        targets[t] = {"train": train_df[t].values, "val": val_df[t].values}
 
     return X_train, X_val, targets, groups_train, df
 
 
-# Approximate number of active days per season (after warmup drop)
-DAYS_PER_SEASON_APPROX = 166   # 180 - 14 warmup days
-
-
 # ═════════════════════════════════════════════════════════════════════════════
-# SECTION 3 — SINGLE MODEL TRAINER
+# SINGLE MODEL TRAINER
 # ═════════════════════════════════════════════════════════════════════════════
 
-def train_single_model(
-    target_name:  str,
-    X_train:      np.ndarray,
-    y_train:      np.ndarray,
-    X_val:        np.ndarray,
-    y_val:        np.ndarray,
-    feature_names: list,
-    groups_train:  np.ndarray = None,
-) -> dict:
-    """
-    Train one XGBoost regressor, run 5-fold CV, and evaluate on held-out val set.
-
-    Steps:
-      1. Initialise XGBRegressor with per-nutrient hyperparameters.
-      2. Run 5-fold cross-validation on training set — reports CV R² mean ± std.
-      3. Fit final model on full training set with early stopping on val set.
-      4. Evaluate on held-out validation set — reports R², RMSE, MAE.
-      5. Extract and sort feature importances (used in thesis Figure X).
-
-    Returns a dict with all metrics and the trained model object.
-    """
-    print(f"\n  {'─'*50}", flush=True)
-    print(f"  Training model for: {target_name}", flush=True)
-    print(f"  {'─'*50}", flush=True)
+def train_single_model(target_name, X_train, y_train, X_val, y_val,
+                       feature_names, groups_train=None) -> dict:
+    """Train one XGBoost regressor with 4-fold farm-aware CV."""
+    print(f"\n  {'─'*55}")
+    print(f"  Training: {target_name}")
+    print(f"  {'─'*55}")
 
     params = HYPERPARAMS[target_name]
 
-    # ── Step 1: 5-fold cross-validation ──────────────────────────────────────
-    print("  Running 5-fold cross-validation...", flush=True)
+    # ── 4-fold CV (leave-one-farm-out on training farms 0-3) ─────────────────
+    print("  Cross-validation (4-fold, leave-one-farm-out)...", flush=True)
+    from sklearn.model_selection import GroupKFold
     cv_model = XGBRegressor(**params)
-    # GroupKFold: each fold withholds one entire farm from training.
-    # WHY: Standard KFold would split within a farm's time series, leaking
-    # future readings into training. GroupKFold ensures the model is tested
-    # on a farm it has never seen — a more realistic generalisation test.
-    # This also explains the CV variance: farms have different soil baselines.
-    gkf = GroupKFold(n_splits=CV_FOLDS)
-
+    gkf      = GroupKFold(n_splits=4)  # 4 training farms → 4 folds
     cv_scores = cross_val_score(
         cv_model, X_train, y_train,
-        cv=gkf, groups=groups_train,
-        scoring=CV_SCORING, n_jobs=-1,
+        cv=gkf, groups=groups_train, scoring="r2", n_jobs=-1,
     )
     cv_mean = float(np.mean(cv_scores))
     cv_std  = float(np.std(cv_scores))
     print(f"  CV R² = {cv_mean:.4f} ± {cv_std:.4f}  "
           f"(folds: {[round(s,3) for s in cv_scores]})")
 
-    # ── Step 2: Final fit with early stopping ─────────────────────────────────
-    # early_stopping_rounds=30: if validation loss doesn't improve for 30 rounds,
-    # stop training. Prevents overfitting on noisy synthetic data.
-    print("  Fitting final model with early stopping...", flush=True)
+    # ── Final fit with early stopping ─────────────────────────────────────────
+    print("  Fitting final model...", flush=True)
     t0 = time.time()
-
-    final_model = XGBRegressor(
-        **params,
-        early_stopping_rounds=30,
-        eval_metric="rmse",
-    )
-    final_model.fit(
-        X_train, y_train,
-        eval_set=[(X_val, y_val)],
-        verbose=False,
-    )
+    final = XGBRegressor(**params, early_stopping_rounds=30, eval_metric="rmse")
+    final.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
     elapsed = time.time() - t0
-    best_round = final_model.best_iteration
-    print(f"  Training complete in {elapsed:.1f}s | Best round: {best_round}")
+    print(f"  Done in {elapsed:.1f}s | Best round: {final.best_iteration}")
 
-    # ── Step 3: Evaluate on validation set ───────────────────────────────────
-    y_pred = final_model.predict(X_val)
-
-    r2   = float(r2_score(y_val, y_pred))
-    rmse = float(np.sqrt(mean_squared_error(y_val, y_pred)))
-    mae  = float(np.mean(np.abs(y_val - y_pred)))
-
-    # Percentage of predictions within ±2 mg/kg of true value
+    # ── Evaluate on held-out farm ─────────────────────────────────────────────
+    y_pred   = final.predict(X_val)
+    r2       = float(r2_score(y_val, y_pred))
+    rmse     = float(np.sqrt(mean_squared_error(y_val, y_pred)))
+    mae      = float(np.mean(np.abs(y_val - y_pred)))
     within_2 = float(np.mean(np.abs(y_val - y_pred) <= 2.0) * 100)
 
-    print(f"  Validation R²   = {r2:.4f}   {'✅ GOOD' if r2 >= 0.80 else '⚠️  WEAK (<0.80)'}")
-    print(f"  Validation RMSE = {rmse:.3f} mg/kg")
-    print(f"  Validation MAE  = {mae:.3f} mg/kg")
-    print(f"  Within ±2mg/kg  = {within_2:.1f}%")
+    threshold = R2_THRESHOLDS[target_name]
+    status    = "✅ GOOD" if r2 >= threshold else f"⚠️  WEAK (< {threshold})"
+    print(f"  Val R²      = {r2:.4f}   {status}")
+    print(f"  Val RMSE    = {rmse:.3f} mg/kg")
+    print(f"  Val MAE     = {mae:.3f} mg/kg")
+    print(f"  Within ±2   = {within_2:.1f}%")
 
-    # ── Step 4: Feature importances ──────────────────────────────────────────
-    importances = final_model.feature_importances_
-    feat_imp = sorted(
-        zip(feature_names, importances),
-        key=lambda x: x[1], reverse=True
-    )
+    # ── Feature importances ───────────────────────────────────────────────────
+    feat_imp = sorted(zip(feature_names, final.feature_importances_),
+                      key=lambda x: x[1], reverse=True)
     print(f"  Top feature: {feat_imp[0][0]} ({feat_imp[0][1]:.3f})")
     print(f"  Feature importances:")
     for fname, fimp in feat_imp:
-        bar = "█" * int(fimp * 40)
-        print(f"    {fname:<25} {fimp:.3f}  {bar}")
+        bar = "█" * int(fimp * 35)
+        print(f"    {fname:<28} {fimp:.3f}  {bar}")
 
     return {
-        "model":        final_model,
+        "model":        final,
         "target":       target_name,
         "cv_r2_mean":   round(cv_mean, 4),
         "cv_r2_std":    round(cv_std, 4),
@@ -318,167 +229,91 @@ def train_single_model(
         "val_rmse":     round(rmse, 4),
         "val_mae":      round(mae, 4),
         "within_2_pct": round(within_2, 2),
-        "best_round":   int(best_round),
-        "feature_importances": {
-            fname: round(float(fimp), 4) for fname, fimp in feat_imp
-        },
+        "best_round":   int(final.best_iteration),
+        "val_farm":     VAL_FARM_ID,
+        "feature_importances": {fn: round(float(fi), 4) for fn, fi in feat_imp},
         "model_version": MODEL_VERSION,
     }
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# SECTION 4 — MODEL QUALITY THRESHOLDS
+# SAVE AND SUMMARISE
 # ═════════════════════════════════════════════════════════════════════════════
 
-# Minimum acceptable R² on the validation set for each nutrient.
-# These are the thresholds you state in your thesis methodology chapter.
-# If any model falls below its threshold, the script warns but does NOT abort
-# (you may still want to use a lower-quality model if data is limited).
-R2_THRESHOLDS = {
-    TARGET_N: 0.82,   # N has the clearest decay signal — should achieve 0.85+
-    TARGET_P: 0.72,   # P has weaker sensor proxy — 0.75+ is realistic
-    TARGET_K: 0.80,   # K intermediate — 0.82+ is realistic
-}
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# SECTION 5 — SAVE MODELS AND REPORT
-# ═════════════════════════════════════════════════════════════════════════════
-
-MODEL_PATHS = {
-    TARGET_N: MODEL_PATH_N,
-    TARGET_P: MODEL_PATH_P,
-    TARGET_K: MODEL_PATH_K,
-}
+MODEL_PATHS = {TARGET_N: MODEL_PATH_N, TARGET_P: MODEL_PATH_P, TARGET_K: MODEL_PATH_K}
 
 def save_results(results: dict) -> None:
-    """
-    Save the three trained models as .joblib files and write a JSON report.
-
-    .joblib is preferred over .pkl for scikit-learn / XGBoost objects because:
-      - It uses efficient numpy array serialisation (faster load time)
-      - It is more stable across numpy version changes than pickle
-      - It works identically on Ubuntu (your laptop) and in deployment
-
-    The JSON report contains all metrics and feature importances — this
-    becomes Table X in your thesis results chapter.
-    """
     os.makedirs(MODELS_DIR, exist_ok=True)
-
     for target, result in results.items():
-        model_path = MODEL_PATHS[target]
-        joblib.dump(result["model"], model_path, compress=3)
-        size_kb = os.path.getsize(model_path) / 1024
-        print(f"  Saved {target} model → {model_path}  ({size_kb:.0f} KB)")
-
-    # Write training report (metrics + feature importances, no model objects)
-    report = {
-        target: {k: v for k, v in res.items() if k != "model"}
-        for target, res in results.items()
-    }
-    report_path = os.path.join(MODELS_DIR, "training_report.json")
-    with open(report_path, "w") as f:
+        joblib.dump(result["model"], MODEL_PATHS[target], compress=3)
+        size_kb = os.path.getsize(MODEL_PATHS[target]) / 1024
+        print(f"  Saved {target} → {MODEL_PATHS[target]}  ({size_kb:.0f} KB)")
+    report = {t: {k: v for k, v in r.items() if k != "model"}
+              for t, r in results.items()}
+    rpath = os.path.join(MODELS_DIR, "training_report.json")
+    with open(rpath, "w") as f:
         json.dump(report, f, indent=2)
-    print(f"  Saved training report → {report_path}")
+    print(f"  Saved report → {rpath}")
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# SECTION 6 — SUMMARY PRINTER
-# ═════════════════════════════════════════════════════════════════════════════
-
-def print_summary(results: dict, total_time: float) -> None:
-    """
-    Print a clean summary table of all three models for the thesis appendix.
-    This is the output you screenshot for your project documentation.
-    """
+def print_summary(results: dict, elapsed: float) -> None:
     print()
     print("═" * 65)
-    print("  TRAINING SUMMARY")
+    print("  TRAINING SUMMARY  (val = fully unseen farm)")
     print("═" * 65)
     print(f"  {'Target':<8} {'CV R²':>8} {'Val R²':>8} {'RMSE':>8} {'MAE':>7} {'±2mg':>7}  Status")
     print("  " + "─" * 60)
-
-    all_passed = True
-    for target in [TARGET_N, TARGET_P, TARGET_K]:
-        r = results[target]
-        threshold = R2_THRESHOLDS[target]
-        status    = "✅ PASS" if r["val_r2"] >= threshold else f"⚠️  < {threshold}"
-        if r["val_r2"] < threshold:
-            all_passed = False
-        print(
-            f"  {target:<8} "
-            f"{r['cv_r2_mean']:>8.4f} "
-            f"{r['val_r2']:>8.4f} "
-            f"{r['val_rmse']:>8.3f} "
-            f"{r['val_mae']:>7.3f} "
-            f"{r['within_2_pct']:>6.1f}%  "
-            f"{status}"
-        )
-
+    all_pass = True
+    for t in [TARGET_N, TARGET_P, TARGET_K]:
+        r = results[t]
+        thr    = R2_THRESHOLDS[t]
+        status = "✅ PASS" if r["val_r2"] >= thr else f"⚠️  < {thr}"
+        if r["val_r2"] < thr: all_pass = False
+        print(f"  {t:<8} {r['cv_r2_mean']:>8.4f} {r['val_r2']:>8.4f} "
+              f"{r['val_rmse']:>8.3f} {r['val_mae']:>7.3f} "
+              f"{r['within_2_pct']:>6.1f}%  {status}")
     print("  " + "─" * 60)
-    print(f"  Total training time: {total_time:.1f}s")
-    print(f"  Model version: {MODEL_VERSION}")
+    print(f"  Training time: {elapsed:.1f}s | Version: {MODEL_VERSION}")
     print()
-
-    if all_passed:
-        print("  🎉 All models meet quality thresholds.")
-        print("  Next step: python ml/evaluate.py  (detailed plots)")
-        print("  Then:      tasks.py stub will be replaced by ml/predictor.py")
+    if all_pass:
+        print("  🎉 All models meet quality thresholds!")
+        print("  Next: python ml/evaluate.py")
+        print("  Then: wire ml/predictor.py into tasks.py")
     else:
         print("  ⚠️  Some models below threshold.")
-        print("  Consider: increasing n_estimators, adding more farms to dataset.")
-
+        print("  Tip: increase N_FARMS in generate_dataset.py to 10+")
     print("═" * 65)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# SECTION 7 — MAIN ENTRY POINT
+# MAIN
 # ═════════════════════════════════════════════════════════════════════════════
 
 def main():
     print("=" * 65)
-    print("  Fodder IoT — XGBoost NPK Model Training")
+    print("  Fodder IoT — XGBoost NPK Model Training  (v2)")
     print("  JKUAT ENE212-0065/2020")
     print("=" * 65)
-    print(f"  Dataset: {DATASET_PATH}")
-    print(f"  Models:  {MODELS_DIR}/")
-    print()
-
-    # ── Check dataset exists ──────────────────────────────────────────────────
     if not os.path.exists(DATASET_PATH):
-        print(f"  ❌ Dataset not found: {DATASET_PATH}")
-        print(f"     Run: python ml/generate_dataset.py  first.")
+        print(f"  ❌ Dataset not found. Run: python ml/generate_dataset.py")
         sys.exit(1)
 
     t_start = time.time()
-
-    # ── Load and split data ───────────────────────────────────────────────────
     X_train, X_val, targets, groups_train, df = load_and_split(DATASET_PATH)
-    print()
 
-    # ── Train all three models ────────────────────────────────────────────────
     results = {}
-    for target_name in [TARGET_N, TARGET_P, TARGET_K]:
-        result = train_single_model(
-            target_name   = target_name,
-            X_train       = X_train,
-            y_train       = targets[target_name]["train"],
-            X_val         = X_val,
-            y_val         = targets[target_name]["val"],
-            feature_names = FEATURE_COLS,
-            groups_train  = groups_train,
+    for target in [TARGET_N, TARGET_P, TARGET_K]:
+        results[target] = train_single_model(
+            target_name=target,
+            X_train=X_train, y_train=targets[target]["train"],
+            X_val=X_val, y_val=targets[target]["val"],
+            feature_names=FEATURE_COLS, groups_train=groups_train,
         )
-        results[target_name] = result
 
-    # ── Save models and report ────────────────────────────────────────────────
-    print(f"\n  {'─'*50}")
-    print("  Saving models and training report...")
+    print(f"\n  {'─'*55}")
+    print("  Saving models...")
     save_results(results)
-
-    total_time = time.time() - t_start
-
-    # ── Print summary ─────────────────────────────────────────────────────────
-    print_summary(results, total_time)
+    print_summary(results, time.time() - t_start)
 
 
 if __name__ == "__main__":

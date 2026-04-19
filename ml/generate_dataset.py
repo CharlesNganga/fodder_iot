@@ -49,6 +49,7 @@ import pandas as pd
 # ── Ensure project root is on path when running standalone ───────────────────
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ml.constants import (
+    K_N_MEAN, K_P_MEAN, K_K_MEAN,
     FEATURE_COLS, TARGET_COLS, META_COLS,
     TARGET_N, TARGET_P, TARGET_K,
     DATASET_PATH,
@@ -350,6 +351,15 @@ def simulate_season(params: dict) -> pd.DataFrame:
                 # At inference: comes from CompositeBaselineLabTest.ec_us_per_cm_at_test_date
                 "baseline_ec_us_per_cm": round(EC0, 2),
                 "ec_depletion_pct":      round(delta_EC / EC0 * 100, 3),  # recalculated below
+
+                # ── Physics-informed decay estimates ─────────────────────
+                # Pre-compute the expected NPK value from KALRO baseline + mean
+                # decay rate. XGBoost corrects the residuals between this
+                # estimate and actual sensor observations.
+                # In tasks.py these are computed from baseline.nitrogen_mg_per_kg etc.
+                "n_decay_estimate": round(params["N0"] * np.exp(-K_N_MEAN * day), 3),
+                "p_decay_estimate": round(params["P0"] * np.exp(-K_P_MEAN * day), 3),
+                "k_decay_estimate": round(params["K0"] * np.exp(-K_K_MEAN * day), 3),
 
                 # ── Target labels ─────────────────────────────────────────
                 TARGET_N: round(N_label, 3),
