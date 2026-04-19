@@ -337,14 +337,19 @@ def simulate_season(params: dict) -> pd.DataFrame:
                 "_moisture_raw":        round(moisture_reading, 2),
 
                 # ── Feature columns (fed to XGBoost — matches FEATURE_COLS) ─
-                "days_since_baseline": day,
-                "ec_25":               round(EC_25, 2),
-                "delta_ec":            round(delta_EC, 2),
-                "ph":                  round(pH_reading, 3),
-                "moisture_7d_avg":     round(moisture_reading, 2),  # recalculated below
-                "ec_7d_avg":           round(EC_25, 2),             # recalculated below
-                "ec_14d_avg":          round(EC_25, 2),             # recalculated below
-                "ec_delta_7d_14d":     0.0,                         # recalculated below
+                "days_since_baseline":   day,
+                "ec_25":                 round(EC_25, 2),
+                "delta_ec":              round(delta_EC, 2),
+                "ph":                    round(pH_reading, 3),
+                "moisture_7d_avg":       round(moisture_reading, 2),        # recalculated below
+                "ec_7d_avg":             round(EC_25, 2),                   # recalculated below
+                "ec_14d_avg":            round(EC_25, 2),                   # recalculated below
+                "ec_delta_7d_14d":       0.0,                               # recalculated below
+                # FIX: baseline_ec stored per-row so the model can normalise
+                # delta_ec against the farm's starting point.
+                # At inference: comes from CompositeBaselineLabTest.ec_us_per_cm_at_test_date
+                "baseline_ec_us_per_cm": round(EC0, 2),
+                "ec_depletion_pct":      round(delta_EC / EC0 * 100, 3),  # recalculated below
 
                 # ── Target labels ─────────────────────────────────────────
                 TARGET_N: round(N_label, 3),
@@ -402,6 +407,8 @@ def compute_rolling_features(df: pd.DataFrame) -> pd.DataFrame:
             .mean()
         )
         chunk["ec_delta_7d_14d"] = chunk["ec_7d_avg"] - chunk["ec_14d_avg"]
+        # Recompute ec_depletion_pct using the stored baseline_ec (not delta_ec placeholder)
+        chunk["ec_depletion_pct"] = chunk["delta_ec"] / chunk["baseline_ec_us_per_cm"] * 100
 
         # Drop warmup rows (first 14 days = 336 readings)
         warmup_rows = ROLLING_WARMUP * READINGS_PER_DAY
