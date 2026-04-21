@@ -1,0 +1,83 @@
+{
+  "N_true": {
+    "target": "N_true",
+    "cv_r2_mean": 0.791,
+    "cv_r2_std": 0.0433,
+    "val_r2": 0.9652,
+    "val_rmse": 1.7094,
+    "val_mae": 1.3438,
+    "within_2_pct": 76.47,
+    "best_round": 67,
+    "val_farm": 4,
+    "feature_importances": {
+      "n_decay_estimate": 0.3745,
+      "ec_depletion_pct": 0.264,
+      "days_since_baseline": 0.0957,
+      "p_decay_estimate": 0.0626,
+      "baseline_ec_us_per_cm": 0.0613,
+      "ph": 0.0605,
+      "k_decay_estimate": 0.0348,
+      "ec_14d_avg": 0.0123,
+      "delta_ec": 0.0119,
+      "ec_7d_avg": 0.0094,
+      "moisture_7d_avg": 0.0073,
+      "ec_25": 0.0046,
+      "ec_delta_7d_14d": 0.001
+    },
+    "model_version": "v2.0-xgb-physics-anchored"
+  },
+  "P_true": {
+    "target": "P_true",
+    "cv_r2_mean": 0.1107,
+    "cv_r2_std": 0.73,
+    "val_r2": 0.7713,
+    "val_rmse": 1.2594,
+    "val_mae": 0.9455,
+    "within_2_pct": 88.23,
+    "best_round": 399,
+    "val_farm": 4,
+    "feature_importances": {
+      "p_decay_estimate": 0.5324,
+      "baseline_ec_us_per_cm": 0.1293,
+      "ph": 0.1179,
+      "k_decay_estimate": 0.1093,
+      "ec_14d_avg": 0.0337,
+      "days_since_baseline": 0.0257,
+      "ec_7d_avg": 0.0232,
+      "n_decay_estimate": 0.0138,
+      "ec_25": 0.0097,
+      "delta_ec": 0.0038,
+      "moisture_7d_avg": 0.0007,
+      "ec_depletion_pct": 0.0006,
+      "ec_delta_7d_14d": 0.0001
+    },
+    "model_version": "v2.0-xgb-physics-anchored"
+  },
+  "K_true": {
+    "target": "K_true",
+    "cv_r2_mean": 0.7996,
+    "cv_r2_std": 0.1056,
+    "val_r2": 0.9594,
+    "val_rmse": 6.3796,
+    "val_mae": 4.9969,
+    "within_2_pct": 25.56,
+    "best_round": 98,
+    "val_farm": 4,
+    "feature_importances": {
+      "k_decay_estimate": 0.5905,
+      "delta_ec": 0.1612,
+      "baseline_ec_us_per_cm": 0.0867,
+      "ph": 0.0406,
+      "ec_depletion_pct": 0.0228,
+      "ec_25": 0.0189,
+      "ec_14d_avg": 0.0175,
+      "days_since_baseline": 0.0172,
+      "n_decay_estimate": 0.0164,
+      "ec_7d_avg": 0.0143,
+      "p_decay_estimate": 0.0117,
+      "moisture_7d_avg": 0.0011,
+      "ec_delta_7d_14d": 0.001
+    },
+    "model_version": "v2.0-xgb-physics-anchored"
+  }
+}
