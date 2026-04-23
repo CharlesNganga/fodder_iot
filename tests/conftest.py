@@ -12,7 +12,7 @@ directly on the live Celery app object — this overrides AFTER app creation.
 import hashlib
 import hmac
 import json
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 
 import pytest
 from django.contrib.auth.models import User
@@ -148,10 +148,15 @@ def field(db, farm, field_boundary):
 @pytest.fixture
 def baseline_lab_test(db, field):
     """Healthy soil — rules engine produces NO_ACTION."""
+    # test_date is set to 10 days ago so that after physics decay the soil
+    # is still healthy (N>30, P>15) and the rules engine produces NO_ACTION.
+    # A fixed date like 2025-03-01 would be 400+ days old by the time this
+    # test runs in 2026, causing the decay estimates to trigger interventions.
+    recent_date = (date.today() - timedelta(days=10)).isoformat()
     return CompositeBaselineLabTest.objects.create(
         field=field,
         season_label="Long Rains 2025",
-        test_date="2025-03-01",
+        test_date=recent_date,
         nitrogen_mg_per_kg=35.0,
         phosphorus_mg_per_kg=18.0,
         potassium_mg_per_kg=150.0,
@@ -168,7 +173,7 @@ def baseline_acidic_soil(db, field):
     return CompositeBaselineLabTest.objects.create(
         field=field,
         season_label="Dry Season 2025 — Acidic Plot",
-        test_date="2025-03-01",
+        test_date=(date.today() - timedelta(days=10)).isoformat(),
         nitrogen_mg_per_kg=15.0,
         phosphorus_mg_per_kg=8.0,
         potassium_mg_per_kg=100.0,
@@ -180,15 +185,26 @@ def baseline_acidic_soil(db, field):
 
 @pytest.fixture
 def baseline_nitrogen_deficient(db, field):
-    """N=12, pH=6.5 — triggers CAN_TOP_DRESS when rain < 15mm."""
+    """
+    Baseline that triggers CAN_TOP_DRESS when rain < 15mm.
+
+    WHY N0=28, test_date=90 days ago (not N0=12, 10 days ago):
+      The XGBoost models were trained on farms with N0 in [25, 60] mg/kg.
+      N0=12 is out-of-distribution — the model extrapolates unpredictably.
+      At 90 days with N0=28: n_decay_estimate = 28 × exp(-0.008×90) = 13.6 mg/kg,
+      which is below the 20 mg/kg CAN threshold, so CAN correctly triggers.
+      P remains at 13.7 mg/kg (above 10 mg/kg DAP threshold), keeping
+      the test focused solely on the CAN rule.
+    """
+    test_date_90d = (date.today() - timedelta(days=90)).isoformat()
     return CompositeBaselineLabTest.objects.create(
         field=field,
         season_label="Long Rains 2025 — N Deficient",
-        test_date="2025-03-01",
-        nitrogen_mg_per_kg=12.0,
-        phosphorus_mg_per_kg=18.0,
+        test_date=test_date_90d,
+        nitrogen_mg_per_kg=28.0,    # in training range [25,60]; decays to ~14 at 90d
+        phosphorus_mg_per_kg=18.0,  # decays to ~13.7 at 90d (above 10mg/kg DAP threshold)
         potassium_mg_per_kg=140.0,
-        ph_at_test_date=6.5,
+        ph_at_test_date=6.5,        # above 5.5 — CAN is not blocked by pH
         ec_us_per_cm_at_test_date=240.0,
         is_active=True,
     )

@@ -219,7 +219,10 @@ class TestDatabaseWrite:
         assert abs(reading.moisture_percent - 51.2) < 0.001
         assert abs(reading.temperature_celsius - 24.3) < 0.001
         assert abs(reading.battery_voltage - 7.1) < 0.001
-        assert reading.is_processed is False  # Celery not invoked by this test class
+        # is_processed is True because CELERY_TASK_ALWAYS_EAGER=True in test settings
+        # means .delay() runs the task synchronously immediately. The pipeline runs
+        # for every reading — is_processed=True is the correct, expected result.
+        assert reading.is_processed is True
 
     @pytest.mark.django_db
     def test_reading_location_stored_as_postgis_point(self, api_client, make_signed_payload):
