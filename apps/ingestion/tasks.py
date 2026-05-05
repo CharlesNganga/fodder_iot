@@ -197,9 +197,11 @@ def _engineer_features(reading, baseline) -> dict | None:
         df = pd.DataFrame(list(recent))
         df["time"] = pd.to_datetime(df["time"])
         df = df.set_index("time").sort_index()
-        ec_7d    = float(df["ec_25_us_per_cm"].last("7D").mean())
-        ec_14d   = float(df["ec_25_us_per_cm"].last("14D").mean())
-        moist_7d = float(df["moisture_percent"].last("7D").mean())
+        cutoff_7d  = df.index.max() - pd.Timedelta("7D")
+        cutoff_14d = df.index.max() - pd.Timedelta("14D")
+        ec_7d    = float(df.loc[df.index >= cutoff_7d,  "ec_25_us_per_cm"].mean())
+        ec_14d   = float(df.loc[df.index >= cutoff_14d, "ec_25_us_per_cm"].mean())
+        moist_7d = float(df.loc[df.index >= cutoff_7d,  "moisture_percent"].mean())
         ec_d7d14 = float(ec_7d - ec_14d)
 
     return {
